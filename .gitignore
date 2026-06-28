@@ -1,0 +1,5 @@
+.venv/
+chroma_db/
+*.swp
+*.pdf
+app.py
