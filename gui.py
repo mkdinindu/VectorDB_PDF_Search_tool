@@ -12,6 +12,7 @@ from functions import (
     chunk_pdf_pages,
     add_to_collection,
     query_collection,
+    similar_terms,
     clear_collection,
 )
 
@@ -91,6 +92,7 @@ class App:
 
         self.build_query_tab()
         self.build_ingest_tab()
+        self.build_term_tab()
 
         status_frame = ttk.Frame(self.root)
         status_frame.pack(fill="x", padx=8, pady=(0, 8))
@@ -281,6 +283,141 @@ class App:
                 page = meta.get("page", 1)
                 if source and os.path.isfile(source):
                     self.viewer.open(source, page)
+                return "break"
+
+        return "break"
+
+    def build_term_tab(self):
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="Find Alternatives")
+
+        top = ttk.Frame(frame)
+        top.pack(fill="x", pady=(5, 5), padx=5)
+        ttk.Label(top, text="Technical term:").pack(side="left")
+        self.term_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.term_var, width=40).pack(side="left", padx=5, fill="x", expand=True)
+        ttk.Button(top, text="Find Alternatives", command=self.find_alternatives).pack(side="left")
+
+        opts = ttk.Frame(frame)
+        opts.pack(fill="x", padx=5, pady=(0, 5))
+        ttk.Label(opts, text="Results:").pack(side="left")
+        self.term_n_var = tk.StringVar(value="5")
+        ttk.Spinbox(opts, from_=1, to=20, textvariable=self.term_n_var, width=4).pack(side="left", padx=5)
+        ttk.Label(opts, text="  (double-click a result to view PDF)").pack(side="left")
+
+        paned = ttk.PanedWindow(frame, orient="horizontal")
+        paned.pack(fill="both", expand=True)
+
+        left = ttk.Frame(paned)
+        paned.add(left, weight=1)
+
+        self.term_results_text = tk.Text(left, wrap="word", font=("Courier", 10), cursor="hand2")
+        self.term_results_text.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+        self.term_results_text.tag_configure("clickable", foreground="#2563eb", underline=1)
+        self.term_results_text.tag_configure("bg_even", background="#f0f4f8")
+        self.term_results_text.tag_configure("bg_odd", background="#ffffff")
+        self.term_results_text.tag_configure("exact_header", foreground="#16a34a", font=("Courier", 10, "bold"))
+        self.term_results_text.tag_configure("alt_header", foreground="#dc2626", font=("Courier", 10, "bold"))
+        self.term_results_text.bind("<Button-1>", self.on_term_result_click)
+        self.term_results_text.bind("<Key>", lambda e: "break")
+
+        scroll = ttk.Scrollbar(self.term_results_text, command=self.term_results_text.yview)
+        self.term_results_text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+
+        right = ttk.Frame(paned)
+        paned.add(right, weight=1)
+        self.term_viewer = PDFViewer(right)
+
+    def find_alternatives(self):
+        term = self.term_var.get().strip()
+        if not term:
+            messagebox.showwarning("Warning", "Enter a technical term.")
+            return
+
+        try:
+            n = int(self.term_n_var.get())
+        except ValueError:
+            n = 5
+
+        def task():
+            try:
+                results = similar_terms(term, n_results=n)
+            except Exception:
+                self.root.after(0, lambda: self.show_term_results(term, None))
+                return
+
+            self.root.after(0, lambda: self.show_term_results(term, results))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def show_term_results(self, term, results):
+        self.term_results_text.delete("1.0", "end")
+        self.term_results_data = []
+
+        if results is None:
+            self.term_results_text.insert("1.0", "Collection is empty.")
+            return
+
+        exact = results["exact_matches"]
+        alts = results["alternative_matches"]
+
+        header = f"Searching for: \"{term}\"\n{'='*60}\n\n"
+        self.term_results_text.insert("1.0", header)
+
+        idx = 0
+
+        if exact:
+            self.term_results_text.insert("end", "EXACT MATCHES:\n", ("exact_header",))
+            self.term_results_text.insert("end", "-" * 40 + "\n")
+            for entry in exact:
+                tag = f"term_result_{idx}"
+                bg = "bg_even" if idx % 2 == 0 else "bg_odd"
+                conf = 1 - entry["distance"]
+                page = entry["metadata"].get("page", "?")
+                source = entry["metadata"].get("source", "?")
+                snippet = entry["text"][:500] + ("..." if len(entry["text"]) > 500 else "")
+
+                line = f"[{idx+1}] Score: {conf:.4f}  Page: {page}  File: {os.path.basename(source)}\n"
+                self.term_results_text.insert("end", line, (tag, "clickable", bg))
+                self.term_results_text.insert("end", f"    {snippet}\n\n", (bg,))
+                self.term_results_data.append(entry)
+                idx += 1
+
+        if alts:
+            self.term_results_text.insert("end", "\nDIFFERENT TERMS USED IN DOCUMENT:\n", ("alt_header",))
+            self.term_results_text.insert("end", "-" * 40 + "\n")
+            for entry in alts:
+                tag = f"term_result_{idx}"
+                bg = "bg_even" if idx % 2 == 0 else "bg_odd"
+                conf = 1 - entry["distance"]
+                page = entry["metadata"].get("page", "?")
+                source = entry["metadata"].get("source", "?")
+                snippet = entry["text"][:500] + ("..." if len(entry["text"]) > 500 else "")
+
+                line = f"[{idx+1}] Score: {conf:.4f}  Page: {page}  File: {os.path.basename(source)}\n"
+                self.term_results_text.insert("end", line, (tag, "clickable", bg))
+                self.term_results_text.insert("end", f"    {snippet}\n\n", (bg,))
+                self.term_results_data.append(entry)
+                idx += 1
+
+        if not exact and not alts:
+            self.term_results_text.insert("end", "No results found.")
+
+    def on_term_result_click(self, event):
+        idx = self.term_results_text.index(f"@{event.x},{event.y}")
+        if not hasattr(self, "term_results_data") or not self.term_results_data:
+            return "break"
+
+        tags = self.term_results_text.tag_names(idx)
+        for tag in tags:
+            if tag.startswith("term_result_"):
+                result_idx = int(tag.split("_")[2])
+                entry = self.term_results_data[result_idx]
+                source = entry["metadata"].get("source", "")
+                page = entry["metadata"].get("page", 1)
+                if source and os.path.isfile(source):
+                    self.term_viewer.open(source, page)
                 return "break"
 
         return "break"

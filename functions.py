@@ -77,6 +77,30 @@ def query_collection(query: str, n_results: int = 3, collection_name="documents"
     results = collection.query(query_texts=[query], n_results=n_results)
     return results
 
+def similar_terms(query: str, n_results: int = 10, collection_name="documents"):
+    results = query_collection(query, n_results=n_results, collection_name=collection_name)
+    if results is None:
+        return None
+    docs = results["documents"][0]
+    dists = results["distances"][0]
+    metas = results["metadatas"][0]
+
+    exact_matches = []
+    alternative_matches = []
+
+    term_lower = query.lower()
+
+    for doc, dist, meta in zip(docs, dists, metas):
+        entry = {"text": doc, "distance": dist, "metadata": meta}
+        if term_lower in doc.lower():
+            exact_matches.append(entry)
+        else:
+            alternative_matches.append(entry)
+    return {
+        "query": query,
+        "exact_matches":exact_matches,
+        "alternative_matches": alternative_matches,
+    }
 
 def clear_collection(collection_name="documents"):
     get_client().delete_collection(name=collection_name)
