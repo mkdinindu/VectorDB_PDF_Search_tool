@@ -102,5 +102,14 @@ def similar_terms(query: str, n_results: int = 10, collection_name="documents"):
         "alternative_matches": alternative_matches,
     }
 
+def get_all_embeddings(collection_name="documents"):
+    client = get_client()
+    collection = client.get_or_create_collection(name=collection_name)
+    if collection.count() == 0:
+        return None
+    result = collection.get(include=["documents", "embeddings", "metadatas"])
+    return result["ids"], result["documents"], result["embeddings"], result["metadatas"]
+
+
 def clear_collection(collection_name="documents"):
     get_client().delete_collection(name=collection_name)
