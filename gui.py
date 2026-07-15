@@ -1,10 +1,21 @@
 import os
+import re
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import fitz
+import numpy as np
 from PIL import Image, ImageTk
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.widgets import RectangleSelector
+from matplotlib.figure import Figure
+from sklearn.manifold import TSNE
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 from functions import (
     get_collection_count,
@@ -14,6 +25,7 @@ from functions import (
     query_collection,
     similar_terms,
     clear_collection,
+    get_all_embeddings,
 )
 
 
@@ -93,6 +105,13 @@ class App:
         self.build_query_tab()
         self.build_ingest_tab()
         self.build_term_tab()
+        self.build_viz_tab()
+
+        self.viz_coords = None
+        self.viz_documents = None
+        self.viz_metadatas = None
+        self.viz_embeddings = None
+        self.rect_selector = None
 
         status_frame = ttk.Frame(self.root)
         status_frame.pack(fill="x", padx=8, pady=(0, 8))
@@ -421,6 +440,173 @@ class App:
                 return "break"
 
         return "break"
+
+    def build_viz_tab(self):
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="Visualize")
+
+        top = ttk.Frame(frame)
+        top.pack(fill="x", padx=5, pady=5)
+        ttk.Button(top, text="Generate Visualization", command=self.generate_visualization).pack(side="left")
+        self.viz_status = ttk.Label(top, text="Click to visualize the vector space.")
+        self.viz_status.pack(side="left", padx=10)
+
+        paned = ttk.PanedWindow(frame, orient="horizontal")
+        paned.pack(fill="both", expand=True)
+
+        left = ttk.Frame(paned)
+        paned.add(left, weight=3)
+
+        self.viz_fig = Figure(figsize=(8, 6), dpi=100, facecolor="white")
+        self.viz_ax = self.viz_fig.add_subplot(111)
+        self.viz_fig.subplots_adjust(left=0.05, right=0.98, top=0.95, bottom=0.05)
+        self.viz_canvas = FigureCanvasTkAgg(self.viz_fig, master=left)
+        self.viz_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        right = ttk.Frame(paned)
+        paned.add(right, weight=1)
+
+        ttk.Label(right, text="Selection Info", font=("Courier", 10, "bold")).pack(pady=(5, 0))
+        self.viz_selection_info = ttk.Label(right, text="Draw a rectangle on the plot to select clusters.")
+        self.viz_selection_info.pack(padx=5, pady=5)
+
+        ttk.Label(right, text="Top Keywords:", font=("Courier", 9, "bold")).pack(padx=5, anchor="w")
+        self.viz_keywords_text = tk.Text(right, wrap="word", state="disabled", height=12, font=("Courier", 9))
+        self.viz_keywords_text.pack(fill="x", padx=5, pady=(0, 5))
+
+        ttk.Label(right, text="Chunks in selection:", font=("Courier", 9, "bold")).pack(padx=5, anchor="w")
+        chunks_frame = ttk.Frame(right)
+        chunks_frame.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+        self.viz_chunks_text = tk.Text(chunks_frame, wrap="word", state="disabled", font=("Courier", 9))
+        self.viz_chunks_text.pack(fill="both", expand=True)
+        chunk_scroll = ttk.Scrollbar(self.viz_chunks_text, command=self.viz_chunks_text.yview)
+        self.viz_chunks_text.configure(yscrollcommand=chunk_scroll.set)
+        chunk_scroll.pack(side="right", fill="y")
+
+    def generate_visualization(self):
+        def task():
+            try:
+                self.root.after(0, lambda: self.viz_status.configure(text="Loading embeddings..."))
+                data = get_all_embeddings()
+
+                if data is None:
+                    self.root.after(0, lambda: self.viz_status.configure(text="No documents in DB."))
+                    return
+
+                ids, documents, embeddings, metadatas = data
+                embeddings_array = np.array(embeddings)
+                n = len(embeddings_array)
+
+                self.root.after(0, lambda: self.viz_status.configure(text=f"Running t-SNE on {n} chunks..."))
+
+                perplexity = min(30, max(2, n - 1))
+                tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, max_iter=1000, learning_rate="auto", init="pca")
+                coords_2d = tsne.fit_transform(embeddings_array)
+
+                self.viz_coords = coords_2d
+                self.viz_documents = documents
+                self.viz_metadatas = metadatas
+                self.viz_embeddings = embeddings_array
+
+                filenames = sorted(set(m.get("filename", "unknown") for m in metadatas))
+                cmap = matplotlib.colormaps.get_cmap("tab20").resampled(max(len(filenames), 1))
+                color_map = {f: cmap(i / max(len(filenames) - 1, 1)) for i, f in enumerate(filenames)}
+                colors = [color_map[m.get("filename", "unknown")] for m in metadatas]
+
+                self.root.after(0, lambda: self._plot_scatter(coords_2d, colors, filenames, n))
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self.root.after(0, lambda: self.viz_status.configure(text=f"Error: {e}"))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _plot_scatter(self, coords, colors, filenames, n):
+        self.viz_ax.clear()
+
+        if self.rect_selector is not None:
+            self.rect_selector.disconnect_events()
+            self.rect_selector = None
+
+        for i, fname in enumerate(filenames):
+            mask = [m.get("filename", "unknown") == fname for m in self.viz_metadatas]
+            pts = coords[mask]
+            short = fname[:35] + ("..." if len(fname) > 35 else "")
+            self.viz_ax.scatter(pts[:, 0], pts[:, 1], c=[colors[j] for j, m in enumerate(self.viz_metadatas) if mask[j]], s=5, alpha=0.6, label=short)
+
+        self.viz_ax.set_title(f"{n} chunks from {len(filenames)} document(s)")
+        if len(filenames) <= 20:
+            self.viz_ax.legend(fontsize=6, loc="best", framealpha=0.7, markerscale=2)
+
+        self.viz_canvas.draw()
+
+        self.rect_selector = RectangleSelector(
+            self.viz_ax, self._on_rectangle_select,
+            useblit=True, button=[1], interactive=True,
+            props=dict(facecolor="royalblue", edgecolor="royalblue", alpha=0.15, linewidth=1),
+        )
+
+        self.viz_status.configure(text=f"Done. {n} chunks plotted. Draw a rectangle to inspect a region.")
+        self.viz_canvas.draw_idle()
+
+    def _on_rectangle_select(self, eclick, erelease):
+        if self.viz_coords is None:
+            return
+
+        x_min, x_max = sorted([eclick.xdata, erelease.xdata])
+        y_min, y_max = sorted([eclick.ydata, erelease.ydata])
+
+        mask = (
+            (self.viz_coords[:, 0] >= x_min) & (self.viz_coords[:, 0] <= x_max) &
+            (self.viz_coords[:, 1] >= y_min) & (self.viz_coords[:, 1] <= y_max)
+        )
+
+        indices = [i for i, m in enumerate(mask) if m]
+        selected_docs = [self.viz_documents[i] for i in indices]
+        selected_meta = [self.viz_metadatas[i] for i in indices]
+
+        self.root.after(0, lambda: self._update_selection_panel(selected_docs, selected_meta))
+
+    def _update_selection_panel(self, docs, metas):
+        self.viz_selection_info.configure(text=f"{len(docs)} chunk(s) selected")
+
+        self.viz_keywords_text.configure(state="normal")
+        self.viz_keywords_text.delete("1.0", "end")
+
+        if len(docs) >= 3:
+            try:
+                cleaned = [re.sub(r"[^a-zA-Z0-9\s]", " ", d.lower()) for d in docs]
+                vectorizer = TfidfVectorizer(max_features=200, stop_words="english", max_df=0.8, ngram_range=(1, 2))
+                tfidf_matrix = vectorizer.fit_transform(cleaned)
+                feature_names = vectorizer.get_feature_names_out()
+                mean_tfidf = np.asarray(tfidf_matrix.mean(axis=0)).flatten()
+                top_indices = mean_tfidf.argsort()[::-1][:15]
+                self.viz_keywords_text.insert("1.0", "Top Keywords (TF-IDF):\n\n")
+                for rank, idx in enumerate(top_indices, 1):
+                    word = feature_names[idx]
+                    score = mean_tfidf[idx]
+                    self.viz_keywords_text.insert("end", f"  {rank:2d}. {word:<22s} {score:.4f}\n")
+            except Exception as e:
+                self.viz_keywords_text.insert("1.0", f"Keyword extraction failed: {e}")
+        elif len(docs) > 0:
+            words = re.findall(r"\b[a-zA-Z]{3,}\b", " ".join(docs).lower())
+            from collections import Counter
+            self.viz_keywords_text.insert("1.0", "Top Words:\n\n")
+            for word, count in Counter(words).most_common(15):
+                self.viz_keywords_text.insert("end", f"  {word:<22s} {count}x\n")
+        else:
+            self.viz_keywords_text.insert("1.0", "No chunks in selection.")
+
+        self.viz_keywords_text.configure(state="disabled")
+
+        self.viz_chunks_text.configure(state="normal")
+        self.viz_chunks_text.delete("1.0", "end")
+        for i, (doc, meta) in enumerate(zip(docs, metas)):
+            page = meta.get("page", "?")
+            source = os.path.basename(meta.get("source", "?"))
+            snippet = doc[:200].replace("\n", " ") + ("..." if len(doc) > 200 else "")
+            self.viz_chunks_text.insert("end", f"[{i+1}] {source} p.{page}\n    {snippet}\n\n")
+        self.viz_chunks_text.configure(state="disabled")
 
     def clear_db(self):
         if not messagebox.askyesno("Confirm", "Delete the entire collection?"):
